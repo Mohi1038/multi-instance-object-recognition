@@ -1,0 +1,434 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[a4paper,margin=0.72in,columnsep=0.25in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+
+\definecolor{accent}{HTML}{B23A48}
+\definecolor{codegray}{HTML}{F3F4F6}
+\definecolor{darkgray}{HTML}{333333}
+\hypersetup{colorlinks=true,linkcolor=accent,citecolor=accent,urlcolor=accent}
+\setlist{nosep,leftmargin=*}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  rulecolor=\color{gray!30},
+  columns=fullflexible,
+  breaklines=true,
+  keepspaces=true
+}
+
+\newcommand{\img}[2][\linewidth]{\includegraphics[width=#1,keepaspectratio]{outputs/#2}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{\textbf{Multi-Instance Coca-Cola Can Recognition in a Cluttered Scene}\\
+\large A custom feature matching, generalized Hough voting, affine RANSAC, and NMS pipeline}
+\author{Computer Vision Assignment 1}
+\date{September 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report presents a complete implementation of multi-instance object recognition for a Coca-Cola can in a cluttered scene. The system detects three red can instances despite substantial scale changes, partial occlusion, perspective variation, and distractor objects. Feature extraction uses SIFT, while descriptor matching, Lowe ratio filtering, generalized Hough voting, affine estimation, RANSAC, geometric verification, intersection-over-union (IoU), and non-maximum suppression are implemented explicitly. The central experimental comparison shows why direct nearest-neighbor matching is insufficient: the naive overlay produces dense, chaotic correspondences across unrelated image regions, whereas the final result retains three spatially coherent affine detections.
+\end{abstract}
+
+\section{Introduction}
+Object recognition in a cluttered image is harder than locating a visually similar patch. Local descriptors can produce plausible matches on repeated text, highlights, edges, and background structure. A useful detector must therefore combine local appearance evidence with a global geometric model.
+
+The goal of this project is to locate every instance of a template Coca-Cola can in a query image. The query contains three red target cans, including a large foreground can that is partially cropped at the bottom, together with silver cans, eyeglasses, a tabletop, and a background wall. The implementation is deliberately constructed without OpenCV's ready-made BFMatcher, FLANN matcher, affine estimator, homography estimator, or clustering routines. This makes each stage explicit and measurable.
+
+The final pipeline is:
+\begin{enumerate}
+  \item extract SIFT keypoints and descriptors;
+  \item compute custom Euclidean descriptor distances and apply the Lowe ratio test;
+  \item convert accepted correspondences into four-dimensional Hough hypotheses;
+  \item cluster votes in center, scale, and rotation space;
+  \item estimate affine transformations with custom three-point RANSAC and least squares;
+  \item verify determinant, scale, reprojection error, polygon validity, and image bounds;
+  \item remove inliers greedily to search for additional instances;
+  \item suppress duplicate boxes with manual IoU-based NMS.
+\end{enumerate}
+
+\section{Input and Recognition Problem}
+Figure~\ref{fig:inputs} shows the template and query image. The template is a portrait-oriented can image. In the query, the three target instances occur at different apparent scales: two are in the background and one is much larger in the foreground. The foreground instance is also truncated by the lower image boundary, making complete template coverage impossible.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.31\textwidth}
+    \centering\img{01_input_images.jpg}
+    \caption{Template and query overview.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.31\textwidth}
+    \centering\img{02_template_keypoints.jpg}
+    \caption{Template SIFT keypoints.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.31\textwidth}
+    \centering\img{03_scene_keypoints.jpg}
+    \caption{Query-scene SIFT keypoints.}
+  \end{subfigure}
+  \caption{Input data and local feature extraction. Keypoints encode image position, scale, and orientation before matching.}
+  \label{fig:inputs}
+\end{figure*}
+
+\section{Feature Extraction and Matching}
+\subsection{SIFT features}
+For each image, the implementation converts BGR input to grayscale and calls OpenCV's SIFT detector. Each keypoint $k$ has image location $(x,y)$, scale $s$, and orientation $\alpha$. The descriptor is a vector in $\R^D$. Figure~\ref{fig:feature-stats} summarizes the detected keypoint scale and orientation distributions.
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering\img{04_keypoint_scale_distribution.png}
+    \caption{Scale.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering\img{05_keypoint_orientation_histogram.png}
+    \caption{Orientation.}
+  \end{subfigure}
+  \caption{SIFT statistics for the template and query.}
+  \label{fig:feature-stats}
+\end{figure}
+
+\subsection{Custom descriptor distance}
+For every scene descriptor $s_i$ and template descriptor $t_j$, the code computes the Euclidean distance
+\begin{equation}
+ d(s_i,t_j)=\left(\sum_{q=1}^{D}(s_{iq}-t_{jq})^2\right)^{1/2}.
+\end{equation}
+For each scene descriptor, the nearest and second-nearest template descriptors are retained. The raw nearest-neighbor correspondence is useful diagnostically but is not yet geometrically trustworthy.
+
+\subsection{Lowe ratio test}
+Let $d_1$ and $d_2$ be the best and second-best descriptor distances. A correspondence is accepted when
+\begin{equation}
+ r=\frac{d_1}{d_2}<\tau,
+ \qquad \tau=0.85.
+\end{equation}
+The ratio rejects ambiguous matches whose nearest template descriptor is not substantially better than the alternatives. In the latest run, 3,166 scene descriptors generated nearest-neighbor candidates, 607 passed the ratio test, and 2,559 were rejected.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{06_naive_matches.jpg}
+    \caption{Direct nearest-neighbor overlay.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{09_matches_after_ratio_test.jpg}
+    \caption{Matches after the Lowe ratio test.}
+  \end{subfigure}
+  \caption{Appearance-only matching. The naive overlay contains many crossing lines because repeated lettering, edges, and background structures can all receive plausible local matches. Ratio filtering reduces the correspondence set, but geometry is still required to isolate object instances.}
+  \label{fig:matching-comparison}
+\end{figure*}
+
+Figure~\ref{fig:matching-diagnostics} provides the numerical matching diagnostics. The descriptor-distance histogram describes raw appearance similarity, while the ratio histogram shows the acceptance threshold used by the matcher.
+
+\begin{figure}[H]
+  \centering
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering\img{07_match_distance_histogram.png}
+    \caption{Descriptor distances.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering\img{08_lowe_ratio_histogram.png}
+    \caption{Lowe ratios.}
+  \end{subfigure}
+  \caption{Matching diagnostics before geometric verification.}
+  \label{fig:matching-diagnostics}
+\end{figure}
+
+\section{Generalized Hough Voting}
+A local correspondence alone does not identify the object center. Let the template image center be $c_t=(w_t/2,h_t/2)$ and let a template keypoint have location $p_t$. The center-to-keypoint vector is
+\begin{equation}
+ v=p_t-c_t.
+\end{equation}
+For a matched scene keypoint $p_s$, keypoint sizes estimate a scale
+\begin{equation}
+ \hat{s}=\frac{s_s}{s_t},
+\end{equation}
+while SIFT orientations estimate a rotation
+\begin{equation}
+ \hat{\theta}=\operatorname{normalize}(\alpha_s-\alpha_t).
+\end{equation}
+The predicted scene center is then
+\begin{equation}
+ \hat{c}_s=p_s-\hat{s}R(\hat{\theta})v,
+ \qquad
+ R(\theta)=
+ \begin{bmatrix}
+ \cos\theta&-\sin\theta\\
+ \sin\theta&\cos\theta
+ \end{bmatrix}.
+\end{equation}
+
+Each match contributes a four-dimensional hypothesis $(\hat{c}_{s,x},\hat{c}_{s,y},\hat{s},\hat{\theta})$. The implementation quantizes these values into bins of 30 pixels in $x$ and $y$, 0.3 in scale, and 20 degrees in angle. Bins with at least three votes become candidate clusters. SIFT's 180-degree orientation ambiguity is folded before center prediction so that symmetric local structures do not split a single object consensus into separate rotations.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering\img{10_hough_center_heatmap.png}
+    \caption{Center accumulation.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering\img{11_hough_scale_distribution.png}
+    \caption{Scale hypotheses.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.32\textwidth}
+    \centering\img{12_hough_rotation_distribution.png}
+    \caption{Rotation hypotheses.}
+  \end{subfigure}
+  \caption{Hough-space evidence. Consistent correspondences accumulate near common object centers and compatible scale and rotation values.}
+  \label{fig:hough-statistics}
+\end{figure*}
+
+Figure~\ref{fig:hough-votes} overlays individual hypotheses and cluster centers on the query. The heatmap and vote visualization expose the transition from scattered local evidence to compact object-level consensus.
+
+\begin{figure}[H]
+  \centering
+  \img{13_hough_votes_visualization.jpg}
+  \caption{Hough votes overlaid on the query scene. Marker size and color indicate cluster support.}
+  \label{fig:hough-votes}
+\end{figure}
+
+\section{Affine Model and RANSAC Verification}
+\subsection{Affine estimation}
+For a candidate cluster, each template point $(x_t,y_t)$ should map to a scene point $(x_s,y_s)$ under an affine transform:
+\begin{equation}
+ \begin{bmatrix}x_s\\y_s\end{bmatrix}
+ =
+ \begin{bmatrix}a&b\\d&e\end{bmatrix}
+ \begin{bmatrix}x_t\\y_t\end{bmatrix}
+ +
+ \begin{bmatrix}c\\f\end{bmatrix}.
+\end{equation}
+For $n$ correspondences, the implementation constructs the linear system $A\beta=B$, where
+\begin{equation}
+ \beta=[a,b,c,d,e,f]^T,
+\end{equation}
+then solves
+\begin{equation}
+ \hat{\beta}=\arg\min_{\beta}\|A\beta-B\|_2^2
+\end{equation}
+with `numpy.linalg.lstsq`. This is a direct least-squares implementation rather than a call to an affine estimation routine.
+
+\subsection{RANSAC}
+A minimal affine model is estimated from three non-collinear correspondences. The model is rejected when its determinant is too close to zero or when its scale is outside $[0.25,4.0]$. For every candidate match, the reprojection error is
+\begin{equation}
+ e_i=\left\|\hat{T}p_{t,i}-p_{s,i}\right\|_2.
+\end{equation}
+A correspondence is an inlier when $e_i<8$ pixels. Each cluster is tested for 3,000 random models. The best model maximizes inlier count, with mean inlier error as the tie-breaker. The final affine matrix is refit using all inliers.
+
+\subsection{Geometric verification}
+The transformed template corners form a quadrilateral. A candidate is retained only if it satisfies all of the following:
+\begin{itemize}
+  \item at least five inliers;
+  \item at least three Hough votes;
+  \item non-negligible affine determinant;
+  \item scale within the configured range;
+  \item mean inlier reprojection error below 10 pixels;
+  \item positive-area, non-self-crossing projected polygon;
+  \item valid bounding-box area and acceptable image-boundary overflow.
+\end{itemize}
+The polygon validity test is particularly important in clutter: four accidental correspondences can otherwise produce a low-error but self-crossing quadrilateral.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{14_ransac_inliers_outliers.jpg}
+    \caption{Inlier and outlier correspondence behavior.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{15_affine_projection.jpg}
+    \caption{Projected template geometry.}
+  \end{subfigure}
+  \caption{Geometric verification. RANSAC preserves spatially consistent correspondences, and the affine projection shows how the template boundary maps onto each candidate can.}
+  \label{fig:geometry}
+\end{figure*}
+
+\section{Multi-Instance Extraction and NMS}
+After accepting a detection, the inlier matches supporting that object are removed from the remaining correspondence set. Hough voting and RANSAC then repeat on the residual matches. This greedy inlier subtraction allows multiple instances to be extracted from one query image.
+
+For two axis-aligned boxes $A$ and $B$, the intersection-over-union is
+\begin{equation}
+ \operatorname{IoU}(A,B)=\frac{|A\cap B|}{|A\cup B|}.
+\end{equation}
+Candidates are sorted by confidence score and a candidate is suppressed when its IoU with an already retained candidate exceeds $0.5$. This removes duplicate hypotheses around the same physical can while retaining spatially separated objects.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{16_detections_before_nms.jpg}
+    \caption{Candidate detections before suppression.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{17_iou_matrix.png}
+    \caption{Candidate overlap matrix.}
+  \end{subfigure}
+  \caption{Duplicate handling. Multiple hypotheses can be generated for one object; NMS retains the strongest spatially consistent box.}
+  \label{fig:nms}
+\end{figure*}
+
+\section{Comparative Analysis}
+\subsection{Progressive reduction of ambiguity}
+The detector can be understood as a sequence of increasingly restrictive representations. Table~\ref{tab:stage-comparison} compares the evidence available at each stage. The number of hypotheses decreases as the system moves from appearance-only matching toward object-level geometric consensus.
+
+\begin{table*}[t]
+\centering
+\caption{Comparison of intermediate representations and their effect on recognition quality.}
+\label{tab:stage-comparison}
+\small
+\begin{tabular}{p{0.16\textwidth}p{0.17\textwidth}p{0.22\textwidth}p{0.22\textwidth}p{0.15\textwidth}}
+\toprule
+Stage & Evidence retained & Main source of noise & Geometric constraint & Interpretation\\
+\midrule
+Naive nearest-neighbor & 3,166 raw correspondences & Repeated letters, rims, highlights, and background texture & None & Dense chaotic overlay; appearance alone is insufficient\\
+Lowe ratio test & 607 accepted correspondences & Descriptor ambiguity remains for repeated artwork & None & Cleaner matches, but no object-level guarantee\\
+Hough voting & 607 hypotheses and 40 vote clusters & Incorrect matches form weak or scattered clusters & Common center, scale, and rotation & Object instances begin to appear as vote consensus\\
+Affine RANSAC & 25 candidates before NMS & Duplicate models for the same instance & One affine transform with error below 8 pixels & Spatially coherent candidate boxes\\
+Final NMS & 3 retained detections & Overlapping duplicate candidates & IoU threshold of 0.5 & One result for each red target can\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+This comparison explains why the stages cannot be collapsed into a single matching operation. The naive stage has high recall for local appearance but poor precision. The ratio test improves descriptor distinctiveness but does not understand the arrangement of points. Hough voting introduces an object-center hypothesis, while affine RANSAC tests whether the same matches can be explained by one transformation. Finally, NMS changes the output from overlapping proposals into a countable set of object instances.
+
+\subsection{Per-instance quantitative comparison}
+The three retained detections also differ in difficulty. Detection 1 corresponds to the large foreground can, which supplies many visible features but is partially cropped. Detections 2 and 3 correspond to smaller background cans with fewer pixels and more surrounding clutter. Table~\ref{tab:instance-comparison} compares their geometric support.
+
+\begin{table*}[t]
+\centering
+\caption{Quantitative comparison of the three final detections.}
+\label{tab:instance-comparison}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+Detection & Hough votes & Inliers & Inlier ratio & Mean error (px) & Scale & Confidence score\\
+\midrule
+Foreground can & 46 & 43 & 0.935 & 2.29 & 0.422 & 47.49\\
+Background can 1 & 15 & 15 & 1.000 & 0.75 & 0.288 & 16.46\\
+Background can 2 & 13 & 13 & 1.000 & 2.97 & 0.348 & 14.15\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The foreground instance has the strongest absolute support because its visible area produces 43 inliers and 46 Hough votes. Its slightly lower inlier ratio is expected: the lower part of the object is outside the image and some descriptors can be confused by nearby objects. The two smaller instances have perfect inlier ratios within their selected clusters, but fewer total votes because they occupy less image area. Mean reprojection error remains below 3 pixels for all three detections, indicating that scale variation does not prevent a consistent affine explanation.
+
+\subsection{Confidence and duplicate suppression}
+The candidate score used by the implementation combines support and geometric accuracy:
+\begin{equation}
+ S=n_{\mathrm{inlier}}+0.1V-0.05\bar{e},
+\end{equation}
+where $n_{\mathrm{inlier}}$ is the number of RANSAC inliers, $V$ is the Hough vote count, and $\bar{e}$ is the mean inlier reprojection error. This favors candidates supported by many correspondences while mildly penalizing inaccurate geometry. NMS then compares candidate boxes using IoU, ensuring that a duplicate does not create a second label for the same can.
+Consequently, a detection with a high score is supported by both appearance evidence and spatial agreement rather than by one isolated feature.
+This ranking also makes the final three detections easier to compare across foreground scale, background clutter, and partial cropping.
+The scoring rule gives priority to detections that explain a larger, internally consistent set of template-to-scene correspondences.
+As a result, weak accidental matches are less likely to survive as separate object labels in the final visualization.
+
+\section{Results}
+Table~\ref{tab:results} reports the latest run. The detector generated 25 candidates before NMS and retained three final detections, matching the three red Coca-Cola cans in the query image.
+
+\begin{table}[H]
+\centering
+\caption{Pipeline summary statistics.}
+\label{tab:results}
+\small
+\begin{tabular}{lr}
+\toprule
+Quantity & Value\\
+\midrule
+Template keypoints & 1,044\\
+Scene keypoints & 3,166\\
+Raw nearest matches & 3,166\\
+Lowe-accepted matches & 607\\
+Rejected matches & 2,559\\
+Hough hypotheses & 607\\
+Hough clusters & 40\\
+RANSAC models tested & 70,487\\
+Candidates before NMS & 25\\
+Final detections & 3\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The three final detections have 43, 15, and 13 inliers, respectively. Their mean reprojection errors are 2.29, 0.75, and 2.97 pixels. These values indicate that the retained correspondences are not merely descriptor-near; they also agree with a common affine geometry.
+
+\begin{figure*}[t]
+  \centering
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{18_final_detection.jpg}
+    \caption{Final NMS-filtered detections.}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\textwidth}
+    \centering\img{19_pipeline_summary.jpg}
+    \caption{Compact end-to-end summary.}
+  \end{subfigure}
+  \caption{Final result. The naive overlay in Figure~\ref{fig:matching-comparison} contains appearance-only noise, while the final processed image retains three coherent object-localized detections.}
+  \label{fig:final-result}
+\end{figure*}
+
+\section{Naive Versus Processed Detection}
+The most important qualitative comparison is between Figures~\ref{fig:matching-comparison} and~\ref{fig:final-result}. In the naive image, every scene descriptor is connected to its nearest template descriptor. Because the image contains repeated Coca-Cola lettering, highlights, can rims, and unrelated textured regions, the correspondence lines cross widely and do not define object instances. A nearest-neighbor match is therefore an appearance hypothesis, not a detection.
+
+The processed result applies three successive forms of structure:
+\begin{enumerate}
+  \item the Lowe ratio rejects ambiguous descriptor matches;
+  \item Hough voting requires multiple matches to agree on a common center, scale, and rotation;
+  \item affine RANSAC requires the same matches to agree on a single geometric transformation.
+\end{enumerate}
+NMS then converts several overlapping hypotheses into one result per physical object. The final image is consequently sparse, interpretable, and directly usable as a localization result.
+
+\section{Implementation Notes and Reproducibility}
+The main implementation is organized into focused Python modules:
+\begin{itemize}
+  \item `features.py`: image loading and SIFT extraction;
+  \item `matching.py`: Euclidean distance, nearest-neighbor matching, and ratio diagnostics;
+  \item `hough.py`: four-dimensional hypothesis generation and custom binning;
+  \item `affine.py` and `ransac.py`: least-squares affine fitting and robust estimation;
+  \item `geometry.py`: projection, polygon validation, bounding boxes, and sanity checks;
+  \item `nms.py`: manual IoU and non-maximum suppression;
+  \item `visualization.py`: report figures and diagnostic plots.
+\end{itemize}
+
+The experiment can be reproduced from the project root with:
+\begin{lstlisting}
+python -m pip install -r requirements.txt
+python main.py
+\end{lstlisting}
+The expected input files are `data/template.jpeg` and `data/query.jpeg`. The program writes the numbered figures and statistics files to `outputs/`.
+
+\section{Limitations and Future Work}
+The affine model is appropriate for moderate viewpoint and scale changes, but it does not model full projective distortion or strong nonrigid deformation. SIFT matching also remains vulnerable to repeated branding patterns, which explains the need for Hough consensus, RANSAC, polygon validation, and NMS. The current implementation uses a greedy instance-extraction strategy; a global multi-model optimization could make competing hypotheses easier to compare. A future extension could also report precision and recall over a labeled test set rather than evaluating one query image qualitatively.
+
+\section{Conclusion}
+This work demonstrates a complete multi-instance recognition pipeline built from interpretable computer-vision components. The system begins with local SIFT features and custom Euclidean descriptor matching, but it does not treat a descriptor match as a final recognition decision. Instead, each correspondence is progressively tested against increasingly stronger constraints: descriptor distinctiveness, agreement in Hough space, consistency with an affine transformation, low reprojection error, valid projected geometry, and overlap-aware suppression.
+
+The comparison between the naive overlay and the final result is the central conclusion of the experiment. Direct nearest-neighbor matching produces a dense and visually confusing network of lines because repeated Coca-Cola lettering, can edges, reflections, and background textures can all appear locally similar to the template. After Lowe ratio filtering, generalized Hough voting, and affine RANSAC, only correspondences that support a common object hypothesis remain. The final NMS-filtered result therefore replaces chaotic appearance evidence with three spatially meaningful detections corresponding to the three red cans in the query image.
+
+The quantitative results support this interpretation. From 3,166 scene keypoints, 607 correspondences passed the ratio test and generated 40 Hough clusters. RANSAC and geometric verification reduced these proposals to 25 candidates before NMS and three final detections. The retained objects were supported by 43, 15, and 13 inliers, with mean reprojection errors of 2.29, 0.75, and 2.97 pixels. These measurements show that the detector remains stable across large scale differences: the foreground can is partially cropped and visually dominant, while the two background cans are smaller and surrounded by more clutter.
+
+The method also illustrates the value of combining complementary representations. SIFT provides local invariance, Hough voting provides a global center-and-scale consensus, affine estimation models the object placement, RANSAC removes mismatched correspondences, and NMS converts multiple hypotheses into one result per physical instance. Because each stage has a clear mathematical role, the intermediate figures can be inspected to understand both successful detections and possible failure cases.
+
+There are still meaningful directions for improvement. A projective model could better handle stronger viewpoint changes than the current affine transformation, while a global multi-model optimization could replace the greedy inlier-subtraction strategy. Evaluation on a larger labeled dataset would also make it possible to report precision, recall, and localization accuracy rather than relying on one qualitative scene. Nevertheless, the current implementation satisfies the main recognition objective and provides a transparent, reproducible demonstration of multi-instance object detection in clutter.
+
+\begin{thebibliography}{9}
+\bibitem{lowe}
+D. G. Lowe, ``Distinctive Image Features from Scale-Invariant Keypoints,'' \emph{International Journal of Computer Vision}, vol. 60, no. 2, pp. 91--110, 2004.
+
+\bibitem{ransac}
+M. A. Fischler and R. C. Bolles, ``Random Sample Consensus: A Paradigm for Model Fitting with Applications to Image Analysis and Automated Cartography,'' \emph{Communications of the ACM}, vol. 24, no. 6, pp. 381--395, 1981.
+
+\bibitem{hough}
+P. V. C. Hough, ``Method and Means for Recognizing Complex Patterns,'' U.S. Patent 3,069,654, 1962.
+\end{thebibliography}
+
+\end{document}
