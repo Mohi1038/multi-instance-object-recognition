@@ -38,6 +38,12 @@ pdflatex report.tex
 
 The report source is [report.tex](report.tex), and the compiled document is [report.pdf](report.pdf).
 
+## Input and Result Images
+
+| Template | Query scene | Final detections |
+| --- | --- | --- |
+| <img src="data/template.jpeg" alt="Template image" width="250"> | <img src="data/query.jpeg" alt="Query scene" width="250"> | <img src="outputs/18_final_detection.jpg" alt="Final detection result" width="250"> |
+
 ## Interactive Architecture
 
 Mermaid diagrams are provided as compact documentation views. Use a Mermaid-enabled Markdown preview or the Mermaid Live Editor to render them.
@@ -198,7 +204,7 @@ $$
 ### Intersection over union
 
 $$
-\operatorname{IoU}(A,B)=\frac{|A\cap B|}{|A\cup B|}.
+\mathrm{IoU}(A,B)=\frac{|A\cap B|}{|A\cup B|}.
 $$
 
 ## Assignment Compliance
